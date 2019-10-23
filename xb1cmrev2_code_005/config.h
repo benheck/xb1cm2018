@@ -2,7 +2,8 @@
 
 //Digital button masks as they are mapped to Port C
 #define aMask 0x02
-#define samplingOffsetDefault 400
+
+uint16_t samplingOffsetDefault = 400;     //XB1 default wait time for valid analog trigger values. Will set lower if PS4 mode
 
 //Pin defines
 #define logFreq     24            //Where the AREF interrupt edge is found (rising)
@@ -27,7 +28,7 @@
 
 #define GPIO1       4
 #define fanControl	46
-
+#define ps4MuxControl 47
 
 //Bitmask defines for the (4) indicator lights on front of unit
 #define lightRecord   0x01
@@ -48,6 +49,12 @@
 #define cameraStart		0x01				//If this bit is set in Camera Control, a pulse is sent to the camera
 #define cameraStop		0x02				//If this bit is set the camera pulse is pulled low
 
+uint8_t ps4Mode = 0;            //By default boot in XB1 mode
+
+uint16_t changeCompare = 0x0FFF;	//What state the buttons are in when inert. Default = XB1. With PS4 some of them are inversed
+
+uint8_t bootFlag = 0;           //Sets flag to clear display
+
 uint16_t fanSpeed = 2900;				//Default duty cycle for fan. Avoid multiples of the sample frequency such as 2000 or 4000. Do not exceed 7500. 
 
 uint8_t streamSticks = 0;				//If 1, stream the left and right stick values over serial port
@@ -66,6 +73,7 @@ uint32_t whatCode = 0;				//Programming code parsed from serial input
 uint16_t timerEntry = 0;			//Tick counter parsed from serial input
 
 uint8_t debounceTimer = 0;
+uint8_t debounceTimerAmount = 15;       //XB1 default.
 
 const int chipSelect = BUILTIN_SDCARD;  // Teensy 3.5 & 3.6 on-board: BUILTIN_SDCARD
 
@@ -75,7 +83,7 @@ const byte mapLight[8] = {2, 14, 7, 8, 6, 20, 21, 5};   //What pins the 8 light 
 const byte mapC[12] = {15, 22, 23, 9, 10, 13, 11, 12, 35, 36, 37, 38};  //What pins the digital buttons attached to
 
 //Define hexidecimal numbers for 7 segment display 0-F, blank space and special characters
-const byte seg7[21] = {0xC0, 0xF9, 0xA4, 0x4B0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90, 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E, 0xFF, 0x8C, 0xAF, 0xA3, 0xC2};
+const byte seg7[24] = {0xC0, 0xF9, 0xA4, 0x4B0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90, 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E, 0xFF, 0x8C, 0xAF, 0xA3, 0xC2, 0x92, 0xFF, 0x89};
 
 volatile uint16_t digits[4] = {0, 0, 0, 0};
 
@@ -143,6 +151,10 @@ uint8_t userLights = 0xF0;  //By default the 4 user lights are off (high)
 
 //Single port value for button status
 uint16_t buttons = 0;     //ABXY UDLR LB RB L3 R3 12 bits of button data, top 4 bits used as Event Flags
+uint16_t buttonsPS4 = 0;  //ABXY UDLR LB RB L3 R3 12 bits of button data, top 4 bits used as Event Flags
+
+#define ps4MaskNormal 0x01FE         //Used to remove the inverse bits from the button input
+#define ps4MaskInverse  0xFE01       //Used to remove the normal bits from the button input
 
 //Variables for when to log analog trigger values
 volatile uint32_t triggerCounter = 0;        //Edge delay for sampling triggers in the active range
@@ -197,12 +209,15 @@ uint8_t LYd = 0; //EEPROM
 
 
 //Analog Stick Digital Pot Ranges
-#define upRange	230			//225			//7.8k = 1.4v parallel
-#define downRange 30		//1.3k = .4v parallel
+uint8_t upRange	= 230;			//225			//7.8k = 1.4v parallel
+uint8_t downRange = 30;		//1.3k = .4v parallel
 
 //Trigger values
 #define upRangeT	10			//225			//7.8k = 1.4v parallel
 #define downRangeT 1		//1.3k = .4v parallel
+
+#define upRangeTPS4  30
+#define downRangeTPS4 125
 
 uint8_t stickRangeLXr = upRange; //150;
 uint8_t stickRangeLXl = downRange; //20;

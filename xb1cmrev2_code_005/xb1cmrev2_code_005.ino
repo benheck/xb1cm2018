@@ -13,19 +13,19 @@ IntervalTimer myTimer;      //For testing purposes without a controller attached
 
 File myFile;
 
-void printDirectory(File dir, int numTabs);
+void printDirectory(File dir, int numTabs); //Set up prototype so it can call itself in its own function
 
 void setup() {
 
   userFunc = &startLogging;           //Default function that's called when you tap USER button
 
   //Begin I2C bus on standard Teensy 3.6 pins
-  Wire.setSCL(33);
+  Wire.setSCL(33);					//Used for digital potentiometer control
   Wire.setSDA(34);
   Wire.begin();
   
   //Uses the 1V8 regulator for both analog triggers and sticks
-  analogReference(EXTERNAL);      
+  analogReference(EXTERNAL);      //Same for both PS4 and XB1. Bodge wires select which voltages are applied for PS4
 
   //Set up MUX control
   pinMode(muxDir, OUTPUT);        //Read or write
@@ -47,12 +47,10 @@ void setup() {
   setPortC(0, 0); //Set lower 12 bits of PortC as Recording Inputs, no pullup (default on boot)
   setLight(0, 0); //Set all 8 bits of Light sensors to input
 
-  pinMode(GPIO1, OUTPUT);				//GPIO 1
-
   pinMode(fanControl, OUTPUT);				//Fan control
   //digitalWrite(fanControl, 1);
   
-  Serial.begin(9600);
+  Serial.begin(9600);				//Serial speed doesn't matter as it's USB
 
   pinMode(camSense, INPUT);         //For getting signals back from camera
   pinMode(camControl, OUTPUT);      //Signal to control camera
@@ -62,22 +60,60 @@ void setup() {
   pinMode(GPIO0, OUTPUT);
   pinMode(GPIO1, OUTPUT);
 
-  //myTimer.begin(edge, 2083.33);   //Run interrupt at 480Hz for testing purposes
+  myTimer.begin(fanOn, 8000);   //Start the fan duty cycle 125 times a second
 
   drawLights();   
   
   //setEdgeMode(0);					//Edge mode reserved for future use
   
-  attachInterrupt(digitalPinToInterrupt(logFreq), edge, RISING);
-  set1X();                           //Default sample rate is 125Hz based off controller timing
+  pinMode(ps4MuxControl, OUTPUT);     //Pin to control analog mux's that allow switching into PS4 mode (PS4 = 0 XB1 = 1)
   
-  displayState = 0;
+  ps4Mode = EEPROM.read(1023);              //Get system boot mode
+  
+  if (ps4Mode == 255) {                     //Nothing set yet? (blank EEPROM)
+    EEPROM.write(1023, 0);                  //Set as 0 (XB1 mode)
+    ps4Mode = 0;                            //Set as XB1 mode
+  }
+  
+  if (digitalRead(userButton) == 0) {      //User button held on boot? Swap modes
+      bootFlag = 99;                         //Set flag to clear the display when USER button released
+      if (ps4Mode) {          //Switch to XB1 mode
+        ps4Mode = 0;
+        displayState = 254;                 //On boot the display will say "XB1" until USER button is released.
+        EEPROM.write(1023, 0);            //Set EEPROM as 0 (XB1)
+      }
+      else {                  //Switch to PS4 mode
+        ps4Mode = 1;
+        displayState = 255;                   //On boot the display will say "PS4" until USER button is released.
+        EEPROM.write(1023, 1);          //Set EEPROM as 1 (PS4)
+      }   
+  }
+
+  if (ps4Mode) {          //Switch to PS4 mode
+  
+    digitalWrite(ps4MuxControl, 0);   //Set bodged MUX to PS4 mode  
+    attachInterrupt(digitalPinToInterrupt(logFreq), edge, FALLING);   //Look for the falling edge of the AREF analog pulse
+    setPS4_250();                   //In USB mode this will be 250Hz in BT it could be up to 800Hz who knows?
+    
+    //These items are different on PS4 than XB1 so change them
+    samplingOffsetDefault = 2;         //Consider the analog trigger sample almost immediately valid (since no HES on PS4)    
+    debounceTimerAmount = 30;       //PS4 buttons stickier for some reason so bump this higher than XB1 controller    
+
+    changeCompare = ps4MaskNormal;	//PS4 mode some buttons are inversed. Use this as the change compare for time of flight timing (as opposed to 0xFFF with XB1)
+
+    upRange	= 245;			//Digital pot ranges are wider for PS4 playback
+    downRange = 10;     //Digital pot ranges are wider for PS4 playback
+    
+  }
+  else {                  //Switch to XB1 mode  
+    digitalWrite(ps4MuxControl, 1);     //Boot in XB1 mode (default)
+    attachInterrupt(digitalPinToInterrupt(logFreq), edge, RISING);
+    set1X();                           //Default sample rate is 125Hz based off controller timing 
+  }  
   
   TeensyDelay::begin();
-  TeensyDelay::addDelayChannel(subEdge, 0); // setup a delay channel and attach the callback function to it
-  //TeensyDelay::trigger(40000, 0);       //Set up the next sub-unit
-
-  TeensyDelay::addDelayChannel(fanOff, 1); //Setup a delay channel for PWMing the fan since we ran out of I/O
+  TeensyDelay::addDelayChannel(subEdge, 0); // setup a delay channel 0 and attach the callback function to it
+  TeensyDelay::addDelayChannel(fanOff, 1);  //Setup a delay channel 1 for PWMing the fan since we ran out of I/O
  
   Serial.print("Initializing SD card...");
 
@@ -92,8 +128,10 @@ void setup() {
 	clearEvents();					//Set all event memory to END statements
 
 	delay(10);
-	getConfig();						//Get defaults from EEPROM
+	getConfig();						//Get defaults from EEPROM. PS4 mode should be set already so offsets are in place
 
+  samplingOffset = samplingOffsetDefault;   //Reload this in case we switched into PS4 mode
+  
 }
 
 void edge() {       //Master clock triggered by the 125Hz AREF coming from controller's analog triggers
@@ -106,17 +144,10 @@ void edge() {       //Master clock triggered by the 125Hz AREF coming from contr
 	}
 
 	//We need to wait samplingOffset before the hall effect sensor value will be valid for the ADC's
-	//So we set a software timer and a flag to do the actual sampling 400us after the interrupt
+	//So we set a software timer and a flag to do the actual sampling 400us after the interrupt (PS4 version the wait is much shorter)
 
 	triggerCounter = micros() + samplingOffset;  //Target is current us time + a value to make sure signal is valid
 	triggered = 2;                    //Set flag to include analog triggers in sample
-
-	if (debounceTimer) {              //Decrement this at 125Hz (if set)
-		debounceTimer--;
-	}
-
-	digitalWrite(fanControl, 1);				//Pulse fan...
-	TeensyDelay::trigger(fanSpeed, 1);				//...and set the timer
 
 }
 
@@ -131,7 +162,18 @@ void subEdge() {    //Sub clock interrupt if you want a sampling rate faster tha
 
 }
 
-void fanOff() {
+void fanOn() {      //Turn on the fan via dedicated interrupt. We've divorced this from sample rate because PS4
+ 
+	digitalWrite(fanControl, 1);				//Turn on fan...
+	TeensyDelay::trigger(fanSpeed, 1);	      //...and set the timer to call the fanOff function
+ 
+ 	if (debounceTimer) {              //Decrement this at 125Hz (if set)
+		debounceTimer--;
+	}
+ 
+}
+
+void fanOff() {		//Function called after delay interrupt to turn off the fan
 
 	digitalWrite(fanControl, 0);
 	
@@ -140,7 +182,7 @@ void fanOff() {
 void loop() {		//The main code loop that runs at appx 550kHz
 
   //digitalWrite(GPIO1, 1);	//Get main loop timing for scope
-  
+
   if (Serial.available() > 1) {	//A command?
     checkCommand();
   }
@@ -150,7 +192,7 @@ void loop() {		//The main code loop that runs at appx 550kHz
     case 1 :        //Waiting for A to be pressed
       if (!(GPIOC_PDIR & aMask)) {
         aState = 2;
-        debounceTimer = 15; //Appx 1/8th of a second
+        debounceTimer = debounceTimerAmount; //Appx 1/8th of a second
       }
     break;
     case 2 :        //Waiting for A to be released (debounce)
@@ -169,7 +211,7 @@ void loop() {		//The main code loop that runs at appx 550kHz
   switch (flightType) {				//Right now just one type checked here but that could change in future
     
     case 1:       //Waiting for a button press?
-      if (GPIOC_PDIR != 0x0FFF) {	//Did anything go low? (pressed)
+      if (GPIOC_PDIR != changeCompare) {	//Did anything go low? (pressed)
         getTimeDigital();				//Jump to timer
       }
     break;
@@ -228,62 +270,70 @@ void loop() {		//The main code loop that runs at appx 550kHz
 
   }
  
-  if (digitalRead(userButton) == 0 and aState == 0 and debounceTimer == 0) {  //User button pressed?
-    debounceTimer = 50;
-    aState = 10;
-    userFunc();							//Call whatever function button is currently assigned to
+  if (bootFlag == 99) {      //User button still held and LED shows monitor mode? (Ps4 or XB1)
+    if (digitalRead(userButton) == 1) {    //See if button released
+      displayState = 0;                    //and start normal operation if so
+      bootFlag = 0;                        //Clear flag
+    }
+  }
+  else {
+    if (digitalRead(userButton) == 0 and aState == 0 and debounceTimer == 0) {  //User button pressed?
+      debounceTimer = 50;
+      aState = 10;
+      userFunc();							//Call whatever function button is currently assigned to
+    }    
   }
   
   if (triggered) {                      //Time to sample data?
 
-	switch(controlSample) {
-	
-		case 1:								//Playback control?
-			if (userCode) {
-				userSampled();
-			}		
-			digitalWrite(GPIO0, 1);
-			controlCycle();                 //Do this immediately (no delay)
-			digitalWrite(GPIO0, 0);
-			triggered = 0;                    //Reset and wait for next controller cycle					
-		break;
-		
-		case 2:								//Event Control?
-			if (--timer == 0) {				//Did we reach an event point?				
-				Serial.print("Event #");
-				Serial.println(eventCounter + 1);
-				event[eventCounter]();				//Jump to specified function and do changes
-				eventCycle();						//Send changes to controller
-				timer = eventEdge[eventCounter];   //Set timer for how long before event changes
-				
-				eventCounter++;						//Increment counter
-				
-				if (flightType == 2) {				//Are we looking for flight time per event?
-					getTimeDigitalEvent();			//Wait for that
-				}	
-			}	
-			eventTimer++;						//Once done, increment this. THis could also execute after mode is ended but that makes no difference
-			triggered = 0;					//Reset and wait for next controller cycle
-		break;
+    switch(controlSample) {
+    
+      case 1:								//Playback control?
+        if (userCode) {
+          userSampled();
+        }		
+        digitalWrite(GPIO0, 1);
+        controlCycle();                 //Do this immediately (no delay)
+        digitalWrite(GPIO0, 0);
+        triggered = 0;                    //Reset and wait for next controller cycle					
+      break;
+      
+      case 2:								//Event Control?
+        if (--timer == 0) {				//Did we reach an event point?				
+          Serial.print("Event #");
+          Serial.println(eventCounter + 1);
+          event[eventCounter]();				//Jump to specified function and do changes
+          eventCycle();						//Send changes to controller
+          timer = eventEdge[eventCounter];   //Set timer for how long before event changes
+          
+          eventCounter++;						//Increment counter
+          
+          if (flightType == 2) {				//Are we looking for flight time per event?
+            getTimeDigitalEvent();			//Wait for that
+          }	
+        }	
+        eventTimer++;						//Once done, increment this. THis could also execute after mode is ended but that makes no difference
+        triggered = 0;					//Reset and wait for next controller cycle
+      break;
 
-		default:							//Sampling mode 0? (default state)
-		  if (micros() > triggerCounter) {    //Has samplingOffsetus passed?
-			//digitalWrite(GPIO0, 1);
-			if (triggered == 2) {             //Is there valid analog trigger data on this sampling cycle? Get it!
-			  LT = analogRead(LTsense) >> 2;    //Get samples and divide by 4
-			  RT = analogRead(RTsense) >> 2;
-			}      
-			sampleCycle();                     //Now sample the rest (happens every cycle)
-			triggered = 0;                    //Reset and wait for next controller cycle
-			//digitalWrite(GPIO0, 0);         //Turn off timing waveform  
-			if (userCode) {					//Call this last so it won't interfere with our sample edge timing
-				userSampled();
-			}
-		  } 		
-		break;
-	
-	}
+      default:							//Sampling mode 0? (default state)
+      
+        if (micros() > triggerCounter) {    //Has samplingOffsetus passed?
+          //digitalWrite(GPIO0, 1);
+          if (triggered == 2) {             //Is there valid analog trigger data on this sampling cycle? Get it!
+            LT = analogRead(LTsense) >> 2;    //Get samples and divide by 4
+            RT = analogRead(RTsense) >> 2;
+          }      
+          sampleCycle();                     //Now sample the rest (happens every cycle)
+          triggered = 0;                    //Reset and wait for next controller cycle
+          //digitalWrite(GPIO0, 0);         //Turn off timing waveform  
+          if (userCode) {					//Call this last so it won't interfere with our sample edge timing
+            userSampled();
+          }
+        } 	         
 
+      break;
+    }
   }
 
 	if (userCode) {						//User code that happens every system cycle, if enabled
@@ -291,7 +341,7 @@ void loop() {		//The main code loop that runs at appx 550kHz
 	}
  
   //digitalWrite(GPIO1, 0);
- 
+
 }  
 
 void userBegin() {	//Command UB calls this function to start executing User Code
@@ -449,6 +499,13 @@ void drawLights() {
 void sampleCycle() {
   
   buttons = GPIOC_PDIR;            //Get the state of the digital buttons. This also clears the top 4 bits so we can add flags
+
+  if (ps4Mode) {                    //Need to invert bits 11, 10, 9 and 0 (L3 R3 L1 L2)
+    buttonsPS4 = ~buttons;          //Copy inverse of buttons to temp variable
+    buttons &= ps4MaskNormal;       //Remove the inverse bits from the buttons word
+    buttonsPS4 &= ps4MaskInverse;   //Remove the normal bits from the inverse bits backup copy
+    buttons |= buttonsPS4;          //Now combine that back with the buttons word
+  }
   
   LX = analogRead(LXsense) >> 2;    //Divide the 10 bit ADC by 4 to fit within a convienent byte
   LY = analogRead(LYsense) >> 2;
@@ -475,7 +532,8 @@ void sampleCycle() {
     }
     
   }
-  
+ 
+
 }
 
 void controlCycle() {	//When playing back a recording, execture this code
@@ -525,10 +583,27 @@ void controlCycle() {	//When playing back a recording, execture this code
   RT = dataLog[logP + 5];         //Offset 5
   buttons = (dataLog[logP + 6] << 8) | dataLog[logP + 7]; //Load and shift offset 6 high low and OR in low byte
 
-  GPIOC_PDOR = ~buttons;  //Set the digital buttons (PORTC transistor control) Need to inverse as they were sampled active low but the transistors are active high
+  if (ps4Mode) {                    //Need to invert bits 11, 10, 9 and 0 (L3 R3 L1 L2)
 
-  sendPots();         //Send the data to the digital potentiometers
-  drawLights();       //Draw the lights on the monitor
+    sendPots();         //Send the data to the digital potentiometers
+    drawLights();       //Draw the lights on the monitor        
+
+    buttonsPS4 = ~buttons;          //Copy inverse of buttons to temp variable
+    buttons &= ps4MaskNormal;       //Remove the inverse bits from the buttons word
+    buttonsPS4 &= ps4MaskInverse;   //Remove the normal bits from the inverse bits backup copy
+    buttons |= buttonsPS4;          //Now combine that back with the buttons word
+    
+    GPIOC_PDOR = ~buttons;  //Set the digital buttons (PORTC transistor control) Need to inverse as they were sampled active low but the transistors are active high
+  
+  }
+  else {
+    GPIOC_PDOR = ~buttons;  //Set the digital buttons (PORTC transistor control) Need to inverse as they were sampled active low but the transistors are active high
+
+    sendPots();         //Send the data to the digital potentiometers
+    drawLights();       //Draw the lights on the monitor    
+  }  
+  
+
 
   if (dataLog[logP + 8] & cameraStart) {		//Bit set to start camera?
 	digitalWrite(camControl, 1);	
@@ -551,13 +626,30 @@ void controlCycle() {	//When playing back a recording, execture this code
 
 void eventCycle() {		//Event-based controller replay mode
 	
-
   sendPots();         //Send the data to the digital potentiometers
-  drawLights();       //Draw the lights on the monitor
+  
   GPIOC_PDOR = ~buttons;  //Set the digital buttons (PORTC transistor control) Need to inverse as they were sampled active low but the transistors are active high
 
-  //dataLog[logP + 9] = GPIOD_PDIR; //Store what's on the light sensor bar this frame
-	
+  if (ps4Mode) {                    //Need to invert bits 11, 10, 9 and 0 for the display in this mode
+
+    uint16_t buttonsBackup = buttons; //The following bitwise operation is destructive so make a backup
+    
+    buttonsPS4 = ~buttons;          //Copy inverse of buttons to temp variable
+    buttons &= ps4MaskNormal;       //Remove the inverse bits from the buttons word
+    buttonsPS4 &= ps4MaskInverse;   //Remove the normal bits from the inverse bits backup copy
+    buttons |= buttonsPS4;          //Now combine that back with the buttons word    
+
+    drawLights();
+    
+    buttons = buttonsBackup;        //Restore backup
+ 
+  }
+  else {
+    drawLights();
+  } 
+
+  //drawLights();       //Draw the lights on the monitor
+  
 }
   
 int getFilename() {  //Waits for a 8 character filename from serial port
@@ -690,7 +782,7 @@ void getTimeDigital() {				//Manual time of flight testing
     Serial.print("average us:");    
     Serial.println(averageUS / sampleCount);
     
-    while(GPIOC_PDIR != 0x0FFF) { //Wait for button release
+    while(GPIOC_PDIR != changeCompare) { //Wait for button release
       delayMicroseconds(1);
     }
 	
@@ -816,10 +908,10 @@ void checkCommand() {
 	
 		op2 = Serial.read(); 	//Get next character
 	
-		if (op2 > '1' and op2 < '8') {	//Meeds at least 2000 to spin up, but don't exceed 8000
+		if (op2 > '1' and op2 < '8') {	//Needs at least 2000 to spin up, but don't exceed 8000
 		
 			op2 -= 48;
-			EEPROM.write(99, op2);				//Store to EEPROM
+			eepromWrite(99, op2);				//Store to EEPROM
 			fanSpeed = (op2 * 1000) - 100;		//Sub 100us here so it triggers before the subEdges do
 			Serial.print("Fan duty cycle = ");
 			Serial.print(fanSpeed + 100);		//Lie about the speed
@@ -920,38 +1012,74 @@ void checkCommand() {
     }
 
   }
-
-  if (op0 == 'E') {     //Set what edge triggers sampling?
-      if (op1 == '0') {
-        setEdgeMode(0);
-      }
-      if (op1 == '1') {
-        setEdgeMode(1);
-      }      
-  }
  
   if (op1 == 'X') {   //Change sampling rate?
-      if (op0 == '1' or op1 == '0') {
-          set1X();
-          Serial.println("Sampling/logging frequency set to 125Hz");
-          Serial.print("Availble logging RAM: ");
-          Serial.print(getTimeLeft());
-          Serial.println(" seconds");
-      }
-      if (op0 == '2') {
-          set2X();
-          Serial.println("Sampling/logging frequency set to 250Hz");
-          Serial.print("Availble logging RAM: ");
-          Serial.print(getTimeLeft());
-          Serial.println(" seconds");
-      }
-      if (op0 == '4') {
-          set4X();
-          Serial.println("Sampling/logging frequency set to 500Hz");
-          Serial.print("Availble logging RAM: ");
-          Serial.print(getTimeLeft());
-          Serial.println(" seconds");
-      }      
+ 
+    timer = 0;        //Reset timer when we do this
+ 
+    switch(op0) {
+      
+      case '0':
+      case '1':
+        set1X();
+        Serial.println("Sampling/logging frequency set to 125Hz");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds");      
+      
+      break;
+      
+      case '2':
+        set2X();
+        Serial.println("Sampling/logging frequency set to 250Hz");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds");      
+      
+      break;
+      
+      case '4':
+        set4X();
+        Serial.println("Sampling/logging frequency set to 500Hz");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds");      
+      break;
+      
+      case 'A':
+        setPS4_250();
+        Serial.println("Sampling/logging frequency set to 250Hz");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds");       
+      break;
+      
+      case 'B':
+        setPS4_500();
+        Serial.println("Sampling/logging frequency set to 500Hz");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds");       
+      break;
+      
+      case 'C':
+        setPS4_1000();
+        Serial.println("Sampling/logging frequency set to 1000Hz");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds");       
+      break;
+      
+      case 'D':
+        setPS4_BT();
+        Serial.println("Sampling/logging frequency locked to BlueTooth");
+        Serial.print("Availble logging RAM: ");
+        Serial.print(showRecordTime());
+        Serial.println(" seconds (appx, non-synced)");       
+      break; 
+            
+    }
+               
   }
 
   if (op0 == 'L') {         //Logging stuff?
@@ -1044,7 +1172,7 @@ void checkCommand() {
       case 'V':
         menuWhich = 1;    			//Trigger ranging menu
         menuState = 0;    			//Start of menu
-		userLights = lightConfig;     //Turn on Playback LED indicator        
+        userLights = lightConfig;     //Turn on CONFIG LED indicator        
       break;
 
     }
@@ -1262,9 +1390,13 @@ void showCommands() {
 	Serial.println(" ");
 
 	Serial.println("---------CONFIGURATION----------------------");   
-	Serial.println("1X - Set sampling/logging frequency to 125Hz");
-	Serial.println("2X - Set sampling/Logging frequency to 250Hz");
-	Serial.println("4X - Set sampling/Logging frequency to 500Hz");
+	Serial.println("1X - (XB1) Set sampling/logging frequency to 125Hz ");
+	Serial.println("2X - (XB1) Set sampling/Logging frequency to 250Hz");
+	Serial.println("4X - (XB1) Set sampling/Logging frequency to 500Hz");
+  Serial.println("AX - (PS4) Set timebase for wired USB 250Hz polling rate (console default)");
+  Serial.println("BX - (PS4) Set timebase for wired USB 500Hz polling rate");
+  Serial.println("CX - (PS4) Set timebase for wired USB 1000Hz polling rate");
+  Serial.println("DX - (PS4) Set timebase for BlueTooth wireless (appx 800Hz, varies)");  
 	//Serial.println("E0 - Use controller sync (default 125Hz)");
 	//Serial.println("E1 - Use Light Sensor 7 monitor sync (triggers on transistion to black)");  
 	Serial.println("AV - Sample and store Analog Stick/Trigger Values");
@@ -1344,6 +1476,8 @@ void showEventCodes() {
 	Serial.println("Example: 1 BAP 125(press enter) = Press A button and wait 1 second");
 	Serial.println("Example: 2 BAR 250(press enter) = Release A button and wait 2 seconds");
 	Serial.println("Example: 3 END 100(press enter) = Ends event playback");	
+	Serial.println("");
+	Serial.println("XB1 mode = always 125 ticks per second. PS4 mode = ticks equal your sampling rate per second default 250Hz");
 	
 }
 
@@ -1358,6 +1492,15 @@ void flush() {			//Flush whatever remains in serial buffer (usually to eat NL CR
 void showStatus() {
   
     Serial.println("STATUS REPORT:");
+    
+    Serial.print("Monitor mode =");
+    
+    if (ps4Mode) {
+      Serial.println(" PS4");
+    }
+    else {
+      Serial.println(" XB1");
+    }
     
     Serial.print("Capture Freqeuncy = ");
     Serial.print(secondsDivider);
@@ -1459,6 +1602,18 @@ void doDisplay() {    //Decide what should go on the 7-segment display (called f
 		digits[2] = 19;
 		digits[3] = 20;			
 	break;
+	case 254:										//"XB1" to tell us what mode it booted into
+		digits[0] = 23;
+		digits[1] = 11;
+		digits[2] = 1;
+		digits[3] = 22;			
+	break;    
+	case 255:										//"PS4 " to tell us what mode it booted into
+		digits[0] = 17;
+		digits[1] = 21;
+		digits[2] = 4;
+		digits[3] = 22;			
+	break;  
   }
 
 }
@@ -2098,59 +2253,106 @@ void eventDRoff() {
 	
 }
 
+//L3, R3, L1, R1 are inversed between XB1 and PS4. XB1 = active low PS4 = active high. Do a check for each of these
+
 void eventL3on() {
 
-	buttons &= ~(1 << 10);
+	if (ps4Mode) {
+		buttons |= (1 << 10);
+	}
+	else {
+		buttons &= ~(1 << 10);
+	}
 	
 }	
 
 void eventL3off() {
 
-	buttons |= (1 << 10);
-	
+	if (ps4Mode) {
+		buttons &= ~(1 << 10);		
+	}
+	else {
+		buttons |= (1 << 10);
+	}
+
 }
 
 void eventR3on() {
 
-	buttons &= ~(1 << 9);
-	
+	if (ps4Mode) {
+		buttons |= (1 << 9);		
+	}
+	else {
+		buttons &= ~(1 << 9);
+	}
+
 }	
 
 void eventR3off() {
 
-	buttons |= (1 << 9);
-	
+	if (ps4Mode) {
+		buttons &= ~(1 << 9);		
+	}
+	else {
+		buttons |= (1 << 9);
+	}
+
 }
 
 void eventLBon() {
 
-	buttons &= ~(1 << 11);
-	
+	if (ps4Mode) {
+		buttons |= (1 << 11);		
+	}
+	else {
+		buttons &= ~(1 << 11);
+	}
+
 }	
 
 void eventLBoff() {
 
-	buttons |= (1 << 11);
-	
+	if (ps4Mode) {
+		buttons &= ~(1 << 11);		
+	}
+	else {
+		buttons |= (1 << 11);
+	}
+
 }
 
 void eventRBon() {
 
-	buttons &= ~(1);
-	
+	if (ps4Mode) {
+		buttons |= 1;		
+	}
+	else {
+		buttons &= ~(1);
+	}
+
 }	
 
 void eventRBoff() {
 
-	buttons |= 1;
-	
+	if (ps4Mode) {
+		buttons &= ~(1);		
+	}
+	else {
+		buttons |= 1;
+	}
+
 }
+
+//End inversed buttons
 
 void beginEvent() {			//Start playing back events stored in memory
 
 	userLights = lightPlayback;     //Turn on Playback LED indicator
 
-	set1X();			//Always play back at 125Hz
+	if (!ps4Mode) {
+		set1X();					//Xb1 locked to 125 ticks/second. PS4 ticks = polled rate
+	}
+
 	Serial.print("Beginning Event Playback");
 	if (flightType == 2) {
 		Serial.println(" with Time of Flight reporting per event.");
@@ -2159,7 +2361,7 @@ void beginEvent() {			//Start playing back events stored in memory
 		Serial.println(".");
 	}
 	
-	buttons = 0x0FFF;				//Set all buttons to OFF
+	buttons = changeCompare;		//Set all buttons to OFF (varies by PS4/XB1)
 	timer = 1;						//Set timer to 1 so first event will execute on next controller sync edge
 	displayState = 3;				//Show event number on LED
 	setControl(2);                  //Enter CONTROL mode, type = event
@@ -2280,45 +2482,105 @@ void setLight(int directionWhich, int pullupsYes) {
 }
 
 void setMultiplier(int whatMultipler) {
-  
-    switch(whatMultipler) {
-      case 0:		//0 or 1 both set no multiplier
-        set1X();
-        break;
-      case 1:		//0 or 1 both set no multiplier
-        set1X();
-        break;				
-      case 2:
-        set2X();
-        break;
-      case 4:
-        set4X();
-        break;       
-    }
+ 
+	if (ps4Mode) {
+		switch(whatMultipler) {
+			case 'A':		//0 or 1 both set no multiplier
+				setPS4_250();
+			break;
+			case 'B':		//0 or 1 both set no multiplier
+				setPS4_500();
+			break;				
+			case 'C':
+				setPS4_1000();
+			break;
+			case 'D':
+				setPS4_BT();
+			break;    
+			default:
+				Serial.println("Invalid frequency setting. Check that monitor is in correct console mode.");
+			break;
+		}		
+	}
+	else {
+		switch(whatMultipler) {
+			case 0:		//0 or 1 both set no multiplier
+				set1X();
+			break;
+			case 1:		//0 or 1 both set no multiplier
+				set1X();
+			break;				
+			case 2:
+				set2X();
+			break;
+			case 4:
+				set4X();
+			break;    
+			default:
+				Serial.println("Invalid frequency setting. Check that monitor is in correct console mode.");
+			break;
+		}		
+	}
 
+}
+
+void setPS4_250() {   //Configure for default PS4 wired USB polling rate of 250Hz (default)
+
+  secondsDivider =  250;
+  subMultiplier = 0;       //The frequency multiplier to apply to input trigger
+  Serial.println("Configured for PS4 wired USB default polling rate of 250Hz"); 
+  
+}
+
+void setPS4_500() {   //Configure for modded polling increase to 500 Hz
+
+  secondsDivider =  500; 
+  subMultiplier = 0;       //The frequency multiplier to apply to input trigger
+  Serial.println("Configured for PS4 wired USB modded polling rate of 500Hz");
+  
+}
+
+void setPS4_1000() {  //Configure for modded polling increase to 1000Hz
+ 
+  secondsDivider =  1000;
+  subMultiplier = 0;       //The frequency multiplier to apply to input trigger
+  Serial.println("Configured for PS4 wired USB modded polling rate of 1000Hz");
+  
+}
+
+void setPS4_BT() {    //Configure an "unlocked" frame rate for uncontroller bluetooth transmission (appx 800Hz)
+
+  secondsDivider =  800;
+  subMultiplier = 0;       //The frequency multiplier to apply to input trigger
+  Serial.println("Configured for PS4 wireless BlueTooth polling rate of appx 800Hz");
+  
 }
 
 void set1X() {
-  
+
   subMultiplier = 0;       //The frequency multiplier to apply to input trigger
   subInterval = 8000;     //The interval between sub divisions. 8000us/interval 
   secondsDivider = 125;   //How many edges make 1 second
-  Serial.println("Edge multiplier set to 1X"); 
-  
+  Serial.println("Edge multiplier set to 1X");     
+
 }
 
 void set2X() {
+
   subMultiplier = 2;       //The frequency multiplier to apply to input trigger. 480Hz default
   subInterval = 4000;     //The interval between sub divisions. 4000us/interval (480Hz default)   
   secondsDivider = 250;   //How many edges make 1 second
-  Serial.println("Edge multiplier set to 2X"); 
+  Serial.println("Edge multiplier set to 2X");    
+
 }
 
 void set4X() {
+  
   subMultiplier = 4;       //The frequency multiplier to apply to input trigger. 480Hz default
   subInterval = 2000;     //The interval between sub divisions. 4000us/interval (480Hz default)  
   secondsDivider = 500;   //How many edges make 1 second 
-  Serial.println("Edge multiplier set to 4X"); 
+  Serial.println("Edge multiplier set to 4X");   
+
 }
 
 void setEdgeMode(int whichMode) {
@@ -2345,6 +2607,12 @@ uint16_t getTimeLeft() {  //Based off pointer position in buffer and sampling sp
   //120k shorts / 5 shorts 
 
   return ((240000 - logP) / 10) / secondsDivider;
+  
+}
+
+uint16_t showRecordTime() { //Show max record time of current settings
+
+    return 24000 / secondsDivider;
   
 }
 
@@ -2413,13 +2681,36 @@ void stopLogging() {
   //Send ending data
   dataLog[logP++] = 255;            //Set timer flag that says we've reached the end (flag for playback)
   dataLog[logP++] = 255;            //Low byte of flag
-  
-  if (subMultiplier) {				//Is this more than zero? (2 or 4)
-	dataLog[logP++] = subMultiplier;  //Store the rate at which this data was collected  
-  }
-  else {
-	dataLog[logP++] = 1;			//It's really zero but put a one here since it makes more sense to humans 
-  }
+
+	if (ps4Mode) {					//PS4 uses A-D to specify playback frequency
+	
+		switch(secondsDivider) {	//Decide what to log based off secondsDivider (don't use 
+			case 250:
+				dataLog[logP++] = 'A';
+			break;
+
+			case 500:
+				dataLog[logP++] = 'B';
+			break;
+
+			case 1000:
+				dataLog[logP++] = 'C';
+			break;
+			
+			case 800:
+				dataLog[logP++] = 'D';
+			break;
+		}
+
+	}
+	else {
+		if (subMultiplier) {				//Is this more than zero? (2 or 4)
+			dataLog[logP++] = subMultiplier;  //Store the rate at which this data was collected  
+		}
+		else {
+			dataLog[logP++] = 1;			//It's really zero but put a one here since it makes more sense to humans 
+		}		
+	}
 
   dataLog[logP++] = edgeSource;     //What trigger edge was used (not implemented yet)
   dataLog[logP++] = 0;
@@ -2633,7 +2924,14 @@ void saveRAM() {
       Serial.print(fileName);
       Serial.print(" on SD card...");
       myFile = SD.open(fileName, FILE_WRITE | O_TRUNC);
-      myFile.println("Frame #,Left Analog X,Left Analog Y,L3,Right Analog X,Right Analog Y,R3,Left Trigger,LB,Right Trigger,RB,A,B,X,Y,UP,DOWN,LEFT,RIGHT,Camera,Sensors,Flags");
+	  
+		if (ps4Mode) {
+			myFile.println("Frame #,Left Analog X,Left Analog Y,L3,Right Analog X,Right Analog Y,R3,Left Trigger,L1,Right Trigger,R1,Cross,Circle,Sqaure,Triangle,UP,DOWN,LEFT,RIGHT,Camera,Sensors,Flags");
+		}
+		else {
+			myFile.println("Frame #,Left Analog X,Left Analog Y,L3,Right Analog X,Right Analog Y,R3,Left Trigger,LB,Right Trigger,RB,A,B,X,Y,UP,DOWN,LEFT,RIGHT,Camera,Sensors,Flags");
+		}
+
       saveToCSV();
       myFile.close(); 
       Serial.println(" done!");    
@@ -3452,14 +3750,14 @@ void rangingPot() {		//Get a value from UART and stores it in the analog pot ran
 }
 
 void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers and joysticks
-  
+
     switch(menuState) {
 
       case 0:
         Serial.println("Analog Input Configuration");
         Serial.println("---------------------------------------------------");
         Serial.println(" ");
-        Serial.println("Leave all analog controls in default positions and tap A...");
+        Serial.println("Leave all analog controls in default positions and tap A / cross...");
         aState = 1;
         menuState = 5;
       break;
@@ -3473,7 +3771,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
           RYc = RY;        
           Serial.println("Default analog values CAPTURED!");
           Serial.println("");
-          Serial.println("Pull LEFT TRIGGER fully and tap A...");
+          Serial.println("Pull LEFT TRIGGER fully and tap A / cross...");
           menuState = 10;
           aState = 1;
         }      
@@ -3485,7 +3783,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
           Serial.println("Left trigger analog range CAPTURED!");
           Serial.println("");
           Serial.println("You can now release the left trigger.");
-          Serial.println("Next, pull RIGHT TRIGGER fully and tap A...");
+          Serial.println("Next, pull RIGHT TRIGGER fully and tap A / cross...");
           menuState = 15;
           aState = 1;
         }
@@ -3497,7 +3795,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
           Serial.println("Right trigger analog range CAPTURED!");
           Serial.println("");
           Serial.println("You can now release the right trigger.");
-          Serial.println("Next, push LEFT ANALOG STICK UP and tap A...");
+          Serial.println("Next, push LEFT ANALOG STICK UP and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 20;
           aState = 1;
@@ -3507,7 +3805,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
         if (aState == 0xFF) {
           //STORE LEFT ANALOG LEFT HERE
           LYu = LY;
-          Serial.println("Next, push LEFT ANALOG STICK DOWN and tap A...");
+          Serial.println("Next, push LEFT ANALOG STICK DOWN and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 25;
           aState = 1;
@@ -3517,7 +3815,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
         if (aState == 0xFF) {
           //STORE LEFT ANALOG LEFT HERE
           LYd = LY;
-          Serial.println("Next, push LEFT ANALOG STICK LEFT and tap A...");
+          Serial.println("Next, push LEFT ANALOG STICK LEFT and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 30;
           aState = 1;
@@ -3527,7 +3825,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
         if (aState == 0xFF) {
           //STORE LEFT ANALOG LEFT HERE
           LXl = LX;
-          Serial.println("Next, push LEFT ANALOG STICK RIGHT and tap A...");
+          Serial.println("Next, push LEFT ANALOG STICK RIGHT and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 35;
           aState = 1;
@@ -3539,7 +3837,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
           LXr = LX;
           Serial.println("Left analog stick range CAPTURED!");
           Serial.println("");        
-          Serial.println("Next, push RIGHT ANALOG STICK UP and tap A...");
+          Serial.println("Next, push RIGHT ANALOG STICK UP and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 40;
           aState = 1;
@@ -3548,7 +3846,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
       case 40:
         if (aState == 0xFF) {
           RYu = RY;
-          Serial.println("Next, push RIGHT ANALOG STICK DOWN and tap A...");
+          Serial.println("Next, push RIGHT ANALOG STICK DOWN and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 45;
           aState = 1;
@@ -3557,7 +3855,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
       case 45:
         if (aState == 0xFF) {
           RYd = RY;
-          Serial.println("Next, push RIGHT ANALOG STICK LEFT and tap A...");
+          Serial.println("Next, push RIGHT ANALOG STICK LEFT and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 50;
           aState = 1;
@@ -3566,7 +3864,7 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
       case 50:
         if (aState == 0xFF) {
           RXl = RX;
-          Serial.println("Next, push LEFT ANALOG STICK RIGHT and tap A...");
+          Serial.println("Next, push LEFT ANALOG STICK RIGHT and tap A / cross...");
           //WHAT'S NEXT???
           menuState = 55;
           aState = 1;
@@ -3668,12 +3966,12 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
         Serial.print("Storing values to EEPROM... ");             
         storeConfig();      //Save new values to EEPROM        
         Serial.println("done!");
-		showRanges();
+        showRanges();
         Serial.println("Analog Ranging Process complete!");
         menuWhich = 0;
         menuState = 0;
         aState = 0; 
-		userLights = lightOff;
+        userLights = lightOff;
       break;
 
     }
@@ -3683,79 +3981,79 @@ void rangeAnalogs() {    //Get the upper and lower ranges of the Analog triggers
 void storeConfig() {        //Writes settings and other data to EEPROM
 
   //Left trigger
-  EEPROM.write(0, LTr);
-  EEPROM.write(1, LTp);
-  EEPROM.write(2, LTedges[0]);
-  EEPROM.write(3, LTedges[1]);  
-  EEPROM.write(4, LTedges[2]);  
+  eepromWrite(0, LTr);
+  eepromWrite(1, LTp);
+  eepromWrite(2, LTedges[0]);
+  eepromWrite(3, LTedges[1]);  
+  eepromWrite(4, LTedges[2]);  
 
   //Right trigger  
-  EEPROM.write(10, RTr);
-  EEPROM.write(11, RTp);  
-  EEPROM.write(12, RTedges[0]);
-  EEPROM.write(13, RTedges[1]);
-  EEPROM.write(14, RTedges[2]);  
+  eepromWrite(10, RTr);
+  eepromWrite(11, RTp);  
+  eepromWrite(12, RTedges[0]);
+  eepromWrite(13, RTedges[1]);
+  eepromWrite(14, RTedges[2]);  
 
   //Left analog X
-  EEPROM.write(20, LXl);
-  EEPROM.write(21, LXc);
-  EEPROM.write(22, LXr);
-  EEPROM.write(23, LXedges[0]);
-  EEPROM.write(24, LXedges[1]);
-  EEPROM.write(25, LXedges[2]);
-  EEPROM.write(26, LXedges[3]);
-  EEPROM.write(27, LXedges[4]);
-  EEPROM.write(28, LXedges[5]);
+  eepromWrite(20, LXl);
+  eepromWrite(21, LXc);
+  eepromWrite(22, LXr);
+  eepromWrite(23, LXedges[0]);
+  eepromWrite(24, LXedges[1]);
+  eepromWrite(25, LXedges[2]);
+  eepromWrite(26, LXedges[3]);
+  eepromWrite(27, LXedges[4]);
+  eepromWrite(28, LXedges[5]);
 
   //Left analog Y
-  EEPROM.write(30, LYu);
-  EEPROM.write(31, LYc);
-  EEPROM.write(32, LYd);
-  EEPROM.write(33, LYedges[0]);
-  EEPROM.write(34, LYedges[1]);
-  EEPROM.write(35, LYedges[2]);
-  EEPROM.write(36, LYedges[3]);
-  EEPROM.write(37, LYedges[4]);
-  EEPROM.write(38, LYedges[5]);
+  eepromWrite(30, LYu);
+  eepromWrite(31, LYc);
+  eepromWrite(32, LYd);
+  eepromWrite(33, LYedges[0]);
+  eepromWrite(34, LYedges[1]);
+  eepromWrite(35, LYedges[2]);
+  eepromWrite(36, LYedges[3]);
+  eepromWrite(37, LYedges[4]);
+  eepromWrite(38, LYedges[5]);
 
   //Right analog X
-  EEPROM.write(40, RXl);
-  EEPROM.write(41, RXc);
-  EEPROM.write(42, RXr);
-  EEPROM.write(43, RXedges[0]);
-  EEPROM.write(44, RXedges[1]);
-  EEPROM.write(45, RXedges[2]);
-  EEPROM.write(46, RXedges[3]);
-  EEPROM.write(47, RXedges[4]);
-  EEPROM.write(48, RXedges[5]);
+  eepromWrite(40, RXl);
+  eepromWrite(41, RXc);
+  eepromWrite(42, RXr);
+  eepromWrite(43, RXedges[0]);
+  eepromWrite(44, RXedges[1]);
+  eepromWrite(45, RXedges[2]);
+  eepromWrite(46, RXedges[3]);
+  eepromWrite(47, RXedges[4]);
+  eepromWrite(48, RXedges[5]);
 
   //Right analog Y
-  EEPROM.write(50, RYu);
-  EEPROM.write(51, RYc);
-  EEPROM.write(52, RYd);
-  EEPROM.write(53, RYedges[0]);
-  EEPROM.write(54, RYedges[1]);
-  EEPROM.write(55, RYedges[2]);
-  EEPROM.write(56, RYedges[3]);
-  EEPROM.write(57, RYedges[4]);
-  EEPROM.write(58, RYedges[5]);  
+  eepromWrite(50, RYu);
+  eepromWrite(51, RYc);
+  eepromWrite(52, RYd);
+  eepromWrite(53, RYedges[0]);
+  eepromWrite(54, RYedges[1]);
+  eepromWrite(55, RYedges[2]);
+  eepromWrite(56, RYedges[3]);
+  eepromWrite(57, RYedges[4]);
+  eepromWrite(58, RYedges[5]);  
 
 
 	//Ranges for mapping analog stick inputs to digital potentiometer control
-  EEPROM.write(60, stickRangeLXr);
-  EEPROM.write(61, stickRangeLXl);
-  EEPROM.write(62, stickRangeLYd);
-  EEPROM.write(63, stickRangeLYu);
+  eepromWrite(60, stickRangeLXr);
+  eepromWrite(61, stickRangeLXl);
+  eepromWrite(62, stickRangeLYd);
+  eepromWrite(63, stickRangeLYu);
 
-  EEPROM.write(64, stickRangeRXr);
-  EEPROM.write(65, stickRangeRXl);
-  EEPROM.write(66, stickRangeRYd);
-  EEPROM.write(67, stickRangeRYu);
+  eepromWrite(64, stickRangeRXr);
+  eepromWrite(65, stickRangeRXl);
+  eepromWrite(66, stickRangeRYd);
+  eepromWrite(67, stickRangeRYu);
   
-  EEPROM.write(68, triggerRangeLL); //triggerRangeLL = 1; //1;
-  EEPROM.write(69, triggerRangeLH); //triggerRangeLH = 10; //10;
-  EEPROM.write(70, triggerRangeRL); //triggerRangeRL = 1; //1; 
-  EEPROM.write(71, triggerRangeRH); //triggerRangeRH = 10; //10;
+  eepromWrite(68, triggerRangeLL); //triggerRangeLL = 1; //1;
+  eepromWrite(69, triggerRangeLH); //triggerRangeLH = 10; //10;
+  eepromWrite(70, triggerRangeRL); //triggerRangeRL = 1; //1; 
+  eepromWrite(71, triggerRangeRH); //triggerRangeRH = 10; //10;
 
 }
 
@@ -3764,94 +4062,101 @@ void getConfig() {        //Reads settings and other data to EEPROM
 	//The analog values are stored in EEPROM so you only have to pair a controller to monitor once.
 	//Each value range has a 10 offset so there's room for future expanion
   
-  LTr = EEPROM.read(0);
-  LTp = EEPROM.read(1);
-  LTedges[0] = EEPROM.read(2);
-  LTedges[1] = EEPROM.read(3); 
-  LTedges[2] = EEPROM.read(4);  
+  LTr = eepromRead(0);
+  LTp = eepromRead(1);
+  LTedges[0] = eepromRead(2);
+  LTedges[1] = eepromRead(3); 
+  LTedges[2] = eepromRead(4);  
   
   //5-9 future use?
   
-  RTr = EEPROM.read(10);
-  RTp = EEPROM.read(11);  
-  RTedges[0] = EEPROM.read(12);
-  RTedges[1] = EEPROM.read(13);
-  RTedges[2] = EEPROM.read(14);
+  RTr = eepromRead(10);
+  RTp = eepromRead(11);  
+  RTedges[0] = eepromRead(12);
+  RTedges[1] = eepromRead(13);
+  RTedges[2] = eepromRead(14);
 
-  LXl = EEPROM.read(20);
-  LXc = EEPROM.read(21);
-  LXr = EEPROM.read(22);
+  LXl = eepromRead(20);
+  LXc = eepromRead(21);
+  LXr = eepromRead(22);
   
   for (g = 0 ; g < 6 ; g++) {
-    LXedges[g] = EEPROM.read(23 + g);
+    LXedges[g] = eepromRead(23 + g);
   }
   
-  LYu = EEPROM.read(30);
-  LYc = EEPROM.read(31);
-  LYd = EEPROM.read(32);
+  LYu = eepromRead(30);
+  LYc = eepromRead(31);
+  LYd = eepromRead(32);
   
   for (g = 0 ; g < 6 ; g++) {
-    LYedges[g] = EEPROM.read(33 + g);
+    LYedges[g] = eepromRead(33 + g);
   }
 
-  RXl = EEPROM.read(40);
-  RXc = EEPROM.read(41);
-  RXr = EEPROM.read(42);
+  RXl = eepromRead(40);
+  RXc = eepromRead(41);
+  RXr = eepromRead(42);
   
   for (g = 0 ; g < 6 ; g++) {
-    RXedges[g] = EEPROM.read(43 + g);
+    RXedges[g] = eepromRead(43 + g);
   }
   
-  RYu = EEPROM.read(50);
-  RYc = EEPROM.read(51);
-  RYd = EEPROM.read(52);
+  RYu = eepromRead(50);
+  RYc = eepromRead(51);
+  RYd = eepromRead(52);
   
   for (g = 0 ; g < 6 ; g++) {
-    RYedges[g] = EEPROM.read(53 + g);
+    RYedges[g] = eepromRead(53 + g);
   }  
 
 
-  if (EEPROM.read(61) == 255) {	//The lower values would never be 255, so a 255 there means blank EEPROM (all 0xFF's) so we need to store some default values
+  if (eepromRead(61) == 255) {	//The lower values would never be 255, so a 255 there means blank EEPROM (all 0xFF's) so we need to store some default values
 	
 	//Store defaults
-	  EEPROM.write(60, upRange);
-	  EEPROM.write(61, downRange);
-	  EEPROM.write(62, upRange);
-	  EEPROM.write(63, downRange);
+	  eepromWrite(60, upRange);
+	  eepromWrite(61, downRange);
+	  eepromWrite(62, upRange);
+	  eepromWrite(63, downRange);
 
-	  EEPROM.write(64, upRange);
-	  EEPROM.write(65, downRange);
-	  EEPROM.write(66, upRange);
-	  EEPROM.write(67, downRange);
-    
- 	  EEPROM.write(68, upRangeT);
-	  EEPROM.write(69, downRangeT);
-	  EEPROM.write(70, upRangeT);
-	  EEPROM.write(71, downRangeT);   
-	  
+	  eepromWrite(64, upRange);
+	  eepromWrite(65, downRange);
+	  eepromWrite(66, upRange);
+	  eepromWrite(67, downRange);
+ 
+    if (ps4Mode) {
+      eepromWrite(68, upRangeTPS4);
+      eepromWrite(69, downRangeTPS4);
+      eepromWrite(70, upRangeTPS4);
+      eepromWrite(71, downRangeTPS4);        
+    }
+    else {
+      eepromWrite(68, upRangeT);
+      eepromWrite(69, downRangeT);
+      eepromWrite(70, upRangeT);
+      eepromWrite(71, downRangeT);       
+    }
   }  
 
-	stickRangeLXr = EEPROM.read(60);
-	stickRangeLXl = EEPROM.read(61);
-	stickRangeLYd = EEPROM.read(62);
-	stickRangeLYu = EEPROM.read(63);
+	stickRangeLXr = eepromRead(60);
+	stickRangeLXl = eepromRead(61);
+	stickRangeLYd = eepromRead(62);
+	stickRangeLYu = eepromRead(63);
 
-	stickRangeRXr = EEPROM.read(64);
-	stickRangeRXl = EEPROM.read(65);
-	stickRangeRYd = EEPROM.read(66);
-	stickRangeRYu = EEPROM.read(67);
+	stickRangeRXr = eepromRead(64);
+	stickRangeRXl = eepromRead(65);
+	stickRangeRYd = eepromRead(66);
+	stickRangeRYu = eepromRead(67);
 
-  triggerRangeLL = EEPROM.read(68);
-  triggerRangeLH = EEPROM.read(69);
-  triggerRangeRL = EEPROM.read(70);
-  triggerRangeRH = EEPROM.read(71);
+  triggerRangeLL = eepromRead(68);
+  triggerRangeLH = eepromRead(69);
+  triggerRangeRL = eepromRead(70);
+  triggerRangeRH = eepromRead(71);
   
-  if (EEPROM.read(99) == 255) {	//Get fan speed. The lower values would never be 255, so a 255 there means blank EEPROM	
+  if (eepromRead(99) == 255) {	//Get fan speed. The lower values would never be 255, so a 255 there means blank EEPROM	
 	//Store fan speed defaults
-	  EEPROM.write(99, 3);  
+	  eepromWrite(99, 3);  
   } 
   
-  fanSpeed = (EEPROM.read(99) * 1000) - 100;	//Get fan defaults and convert to interrupt driven duty cycle
+  fanSpeed = (eepromRead(99) * 1000) - 100;	//Get fan defaults and convert to interrupt driven duty cycle
 	
   Serial.println("EEPROM defaults loaded");  
   
@@ -3893,6 +4198,26 @@ void showRanges() {
     Serial.print(RYc);
     Serial.write(9);
     Serial.println(RYd);  
+  
+}
+
+void eepromWrite(uint16_t address, uint8_t data) {
+
+    if (ps4Mode) {
+      address += 1024;        //Jump 4 pages in memory for PS4 settings
+    }
+  
+    EEPROM.write(address, data);    //Now call actual function
+  
+}
+
+uint8_t eepromRead(uint16_t address) {
+  
+     if (ps4Mode) {
+      address += 1024;        //Jump 4 pages in memory for PS4 settings
+    }
+
+    return EEPROM.read(address);  //Get the data from actual function
   
 }
 
